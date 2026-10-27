@@ -1,0 +1,6 @@
+/target
+**/*.db
+**/wal.log
+**/*.pages
+**/catalog.bin
+.DS_Store

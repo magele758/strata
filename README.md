@@ -1,0 +1,65 @@
+# Strata
+
+Single-node composable database. One transactional heap, several access methods, and a columnar replica fed by the commit log. It is not a distributed engine and it does not try to beat ClickHouse, Qdrant, or Postgres at their own jobs.
+
+## Run
+
+```bash
+cargo run -- init ./demo
+cargo run -- exec ./demo --sql "CREATE TABLE t (id INT PRIMARY KEY, name TEXT); INSERT INTO t VALUES (1, 'a'); SELECT * FROM t;"
+cargo run -- shell ./demo
+cargo run -- check ./demo
+cargo run -- backup ./demo ./demo.bak
+cargo run -- serve ./demo --addr 127.0.0.1:7432 --password secret
+```
+
+`exec` is auto-commit. `shell` and `serve` keep a session, so `BEGIN` / `COMMIT` stick on that connection.
+
+Library entry points are `Database::create`, `Database::open`, `Database::execute`, and `Database::execute_session`.
+
+## SQL
+
+`CREATE/DROP TABLE`, `CREATE/DROP INDEX ... USING btree|inverted|hnsw`, `INSERT`, `UPDATE`, `DELETE`, `SELECT` with `WHERE`, `JOIN`, `GROUP BY`, `ORDER BY`, `LIMIT`, aggregates `count/sum/avg/min/max`, `EXPLAIN`, `BEGIN/COMMIT/ROLLBACK`, `VACUUM`, `FLUSH COLUMNAR`, `CHECKPOINT`, `SHOW TABLES`, `DESCRIBE`, `SHOW STATS`.
+
+Types: `INT`, `FLOAT`, `BOOL`, `TEXT`, `VECTOR(n)`. A vector literal is the text `'[1,0,0]'`.
+
+```sql
+CREATE INDEX t_name ON t USING inverted (name);
+SELECT name FROM t WHERE search(name, 'hello');
+
+CREATE INDEX t_v ON t USING hnsw (v);
+SELECT id FROM t WHERE knn(v, '[1,0,0]', 5);
+```
+
+`search` is conjunctive BM25. `knn` is L2. HNSW dimensions are 1..=64.
+
+## What is actually durable
+
+- 4KB pages, checksummed. Torn pages fail the checksum.
+- Commit flushes the WAL and not the data pages (no-force). Dirty pages can be stolen only after their LSN is flushed.
+- Recovery replays page images from the last checkpoint, then undoes transactions that have no commit record.
+- `Database::simulate_crash` drops the cache without a checkpoint. The next `open` must rebuild from the WAL. Normal drop checkpoints.
+- One process holds `strata.lock`. A second open fails.
+
+Isolation is snapshot isolation, not serializable. One writer at a time. Other sessions can keep a snapshot and read. A second writer gets an error until the first commits or rolls back. That limit exists because undo restores page images; interleaved writers on the same page would wipe each other.
+
+## Access methods and the columnar replica
+
+B+tree keys include the row id, so an update can leave the old version visible to older snapshots. Uniqueness is checked by visibility, not by a single key.
+
+Inverted and HNSW indexes live in the same page file and the same WAL group as the heap. They are not side databases.
+
+`FLUSH COLUMNAR` applies committed logical operations to Parquet segments under `col/`. A scan uses that replica only when it has caught up to the WAL. Otherwise it reads the heap. `EXPLAIN` prints `SeqScan`, `IndexScan`, or `ColumnarScan`.
+
+## Layout
+
+```
+demo/
+  data.pages
+  wal.log
+  catalog.bin
+  strata.lock
+  col/
+```
+
+License: Apache-2.0.

@@ -1,0 +1,24 @@
+[package]
+name = "strata"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Single-node composable transactional database: heap MVCC, WAL recovery, pluggable access methods, columnar replica"
+readme = "README.md"
+
+[[bin]]
+name = "strata"
+path = "src/bin/strata.rs"
+
+[dependencies]
+crc32fast = "1.4"
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+sqlparser = "0.51"
+arrow = "53"
+parquet = "53"
+
+[profile.release]
+lto = false
+codegen-units = 1
