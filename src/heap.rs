@@ -17,8 +17,8 @@ use std::collections::HashSet;
 use crate::buffer::BufferPool;
 use crate::error::{Error, Result};
 use crate::types::{
-    read_u16, read_u32, write_u16, write_u32, write_u64, Page, PageId, PageKind, Rid, MAX_TUPLE,
-    PAYLOAD_LEN,
+    read_u16, read_u32, read_u64, write_u16, write_u32, write_u64, Page, PageId, PageKind, Rid,
+    MAX_TUPLE, PAYLOAD_LEN,
 };
 
 const DIR_LEN: usize = 8;
@@ -59,6 +59,20 @@ impl Heap {
         value: u64,
     ) -> crate::error::Result<()> {
         write_header_u64(pool, rid, offset, value)
+    }
+
+    pub fn header(
+        pool: &crate::buffer::BufferPool,
+        rid: crate::types::Rid,
+    ) -> crate::error::Result<Option<(u64, u64, u64, u64)>> {
+        header(pool, rid)
+    }
+
+    pub fn clear_slot(
+        pool: &crate::buffer::BufferPool,
+        rid: crate::types::Rid,
+    ) -> crate::error::Result<()> {
+        clear_slot(pool, rid)
     }
 
     pub fn scan(
@@ -146,6 +160,46 @@ pub fn write_header_u64(pool: &BufferPool, rid: Rid, offset: usize, value: u64) 
             });
         }
         write_u64(payload, at, value);
+        Ok(())
+    })
+}
+
+pub fn header(pool: &BufferPool, rid: Rid) -> Result<Option<(u64, u64, u64, u64)>> {
+    let pin = pool.pin(PageId(rid.page))?;
+    let page = pin.read()?;
+    let bytes = match live_slot_bytes(&page, rid.slot) {
+        Ok(bytes) => bytes,
+        Err(Error::NotFound) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if bytes.len() < TUPLE_HEADER {
+        return Err(Error::Corrupt {
+            detail: "tuple slot has no 32-byte header".into(),
+        });
+    }
+    let xmin_txn = read_u64(bytes, 0)?;
+    let xmin_ts = read_u64(bytes, 8)?;
+    let xmax_txn = read_u64(bytes, 16)?;
+    let xmax_ts = read_u64(bytes, 24)?;
+    Ok(Some((xmin_txn, xmin_ts, xmax_txn, xmax_ts)))
+}
+
+pub fn clear_slot(pool: &BufferPool, rid: Rid) -> Result<()> {
+    let pin = pool.pin(PageId(rid.page))?;
+    pin.modify(|page| {
+        require_heap(page)?;
+        let payload = page.payload_mut();
+        let dir = read_dir(payload)?;
+        if rid.slot >= dir.slot_count {
+            return Ok(());
+        }
+        let (off, len) = read_slot(payload, rid.slot)?;
+        if off == 0 && len == 0 {
+            return Ok(());
+        }
+        let pos = slot_position(rid.slot)?;
+        write_u16(payload, pos, 0);
+        write_u16(payload, pos + 2, 0);
         Ok(())
     })
 }

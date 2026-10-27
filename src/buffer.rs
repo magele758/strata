@@ -291,16 +291,27 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Restore this transaction's before-images and append Abort. Idempotent with recovery.
+    /// Undo this transaction and append Abort. Idempotent with recovery.
+    /// Logical ops are undone tuple-wise; only legacy records restore page images.
     pub fn undo_txn(&self, txn_id: u64) -> Result<()> {
-        let mut st = lock(&self.inner)?;
-        let recs: Vec<WalRecord> = st
-            .records
-            .iter()
-            .filter(|r| r.kind == WalKind::Mutation && r.txn_id == txn_id)
-            .cloned()
-            .collect();
+        let recs: Vec<WalRecord> = {
+            let st = lock(&self.inner)?;
+            st.records
+                .iter()
+                .filter(|r| r.kind == WalKind::Mutation && r.txn_id == txn_id)
+                .cloned()
+                .collect()
+        };
         for rec in recs.iter().rev() {
+            if let Some(op) = &rec.logical {
+                crate::undo::undo_op(self, txn_id, op)?;
+            }
+        }
+        let mut st = lock(&self.inner)?;
+        for rec in recs.iter().rev() {
+            if rec.logical.is_some() {
+                continue;
+            }
             for image in rec.pages.iter().rev() {
                 st.force_image(image.page_id, &image.before)?;
             }
@@ -384,14 +395,24 @@ impl BufferPool {
             .collect();
         losers.sort_unstable();
         losers.dedup();
+        let mut logical_undos: Vec<(u64, LogicalOp)> = Vec::new();
         for rec in tail.iter().rev() {
             if rec.kind != WalKind::Mutation || committed.contains(&rec.txn_id) {
                 continue;
             }
-            for image in rec.pages.iter().rev() {
-                st.force_image(image.page_id, &image.before)?;
+            if let Some(op) = &rec.logical {
+                logical_undos.push((rec.txn_id, op.clone()));
+            } else {
+                for image in rec.pages.iter().rev() {
+                    st.force_image(image.page_id, &image.before)?;
+                }
             }
         }
+        drop(st);
+        for (txn_id, op) in &logical_undos {
+            crate::undo::undo_op(self, *txn_id, op)?;
+        }
+        let mut st = lock(&self.inner)?;
         for txn_id in &losers {
             let already = tail.iter().any(|r| r.kind == WalKind::Abort && r.txn_id == *txn_id);
             if !already {

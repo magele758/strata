@@ -38,10 +38,10 @@ SELECT id FROM t WHERE knn(v, '[1,0,0]', 5);
 
 - 4KB pages, checksummed. Torn pages fail the checksum.
 - Commit flushes the WAL and not the data pages (no-force). Dirty pages can be stolen only after their LSN is flushed.
-- Recovery replays page images from the last checkpoint, then undoes transactions that have no commit record.
+- Recovery replays page images from the last checkpoint, then undoes a loser's tuples. It does not restore that loser's whole page when the mutation recorded a logical operation.
 - `Database::simulate_crash` drops the cache without a checkpoint. The next `open` must rebuild from the WAL. Normal drop checkpoints.
 - One process holds `strata.lock`. A second open fails.
-- A second writer waits for the open write transaction. A reader can run between that writer's statements and keeps its own snapshot. The statement itself still holds the database lock.
+- Two write transactions can change different rows at the same time. Undo clears that transaction's tuple stamps and leaves the other row in place. Two updates of the same row still conflict. The statement itself still holds the database lock.
 
 `replicate` copies every committed page image from the primary WAL into another directory. That standby can be opened and read. It does not tail the log live, and it does not elect a new leader.
 
@@ -49,7 +49,7 @@ SELECT id FROM t WHERE knn(v, '[1,0,0]', 5);
 
 `serve` accepts at most 128 connections. `strata::pgwire::serve_simple` speaks a Postgres simple-query subset, without TLS and without the extended protocol.
 
-Isolation is snapshot isolation, not serializable. Undo still restores whole page images, so two writers are not allowed to interleave. The second one waits.
+Isolation is snapshot isolation, not serializable.
 
 ## Access methods and the columnar replica
 

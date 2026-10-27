@@ -115,10 +115,6 @@ impl Database {
 
     pub fn execute_session(&self, session: &mut Session, sql: &str) -> Result<ExecuteResult> {
         self.ensure_gate_id(session);
-        if sql_may_write(sql) && !session.holding_write {
-            self.gate.acquire(session.gate_id, self.lock_wait())?;
-            session.holding_write = true;
-        }
         let result = {
             let guard = self.lock_inner()?;
             let inner = guard.as_ref().ok_or(Error::Closed)?;
@@ -153,6 +149,7 @@ impl Database {
         }
     }
 
+    #[allow(dead_code)]
     fn lock_wait(&self) -> Option<Duration> {
         let Ok(guard) = self.inner.lock() else {
             return None;
@@ -225,14 +222,21 @@ impl Drop for Database {
 }
 
 impl Inner {
-    fn mutate<T>(&self, txn: u64, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+    /// `logical` is the WAL mutation's undo op. A closure that allocates a rid
+    /// fills `logical` before returning so `end_group` records that tuple.
+    fn mutate<T>(
+        &self,
+        txn: u64,
+        mut logical: Option<LogicalOp>,
+        f: impl FnOnce(&Self, &mut Option<LogicalOp>) -> Result<T>,
+    ) -> Result<(T, Option<LogicalOp>)> {
         let before = self.catalog.borrow().encode()?;
         self.pool.begin_group()?;
-        match f(self) {
+        match f(self, &mut logical) {
             Ok(v) => {
                 let after = self.catalog.borrow().encode()?;
-                self.pool.end_group(txn, &before, &after, None)?;
-                Ok(v)
+                self.pool.end_group(txn, &before, &after, logical.as_ref())?;
+                Ok((v, logical))
             }
             Err(e) => {
                 let _ = self.pool.abort_group();
@@ -251,17 +255,8 @@ impl Inner {
         id
     }
 
-    fn claim_writer(&self, txn: u64) -> Result<()> {
-        match self.writer.get() {
-            Some(id) if id != txn => Err(Error::Txn(
-                "another transaction is writing; commit or roll it back first".into(),
-            )),
-            Some(_) => Ok(()),
-            None => {
-                self.writer.set(Some(txn));
-                Ok(())
-            }
-        }
+    fn claim_writer(&self, _txn: u64) -> Result<()> {
+        Ok(())
     }
 
     fn ddl(&self, f: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
@@ -269,7 +264,7 @@ impl Inner {
             return Err(Error::Txn("DDL requires no open transaction".into()));
         }
         let txn = self.alloc_txn();
-        self.mutate(txn, f)?;
+        self.mutate(txn, None, |this, _| f(this))?;
         let ts = self.catalog.borrow().next_commit_ts + 1;
         self.pool.append_commit(txn, ts, &[])?;
         self.pool.flush_wal()?;
@@ -322,7 +317,7 @@ impl Store for Inner {
             return Ok(());
         }
         let ts = self.catalog.borrow().next_commit_ts + 1;
-        self.mutate(txn, |this| {
+        self.mutate(txn, None, |this, _| {
             for op in &active.ops {
                 match op {
                     LogicalOp::Insert { rid_page, rid_slot, table_id, .. } => {
@@ -499,21 +494,21 @@ impl Store for Inner {
         let table = self.table(table)?;
         self.check_values(&table, values)?;
         let tuple = tuple::encode_tuple(txn, 0, 0, 0, values)?;
-        let rid = self.mutate(txn, |this| {
+        let (_rid, op) = self.mutate(txn, None, |this, logical| {
             this.ensure_unique(&table, values, txn, None)?;
             let id = Heap::insert(this.pool(), PageId(table.heap_root), &tuple)?;
             this.maintain_insert(&table, id, values)?;
+            *logical = Some(LogicalOp::Insert {
+                table_id: table.id,
+                rid_page: id.page,
+                rid_slot: id.slot,
+                values: values.to_vec(),
+            });
             Ok(id)
         })?;
-        self.push_op(
-            txn,
-            LogicalOp::Insert {
-                table_id: table.id,
-                rid_page: rid.page,
-                rid_slot: rid.slot,
-                values: values.to_vec(),
-            },
-        )?;
+        self.push_op(txn, op.ok_or_else(|| Error::Corrupt {
+            detail: "insert missing logical op".into(),
+        })?)?;
         Ok(())
     }
 
@@ -525,19 +520,19 @@ impl Store for Inner {
             let bytes = Heap::read(self.pool(), *id)?;
             let dec = tuple::decode_tuple(&bytes)?;
             claim(&dec, txn, snapshot)?;
-            self.mutate(txn, |this| {
+            let op = LogicalOp::Delete {
+                table_id: table.id,
+                rid_page: id.page,
+                rid_slot: id.slot,
+                values: dec.values,
+            };
+            let (_, op) = self.mutate(txn, Some(op), |this, _| {
                 Heap::write_header_u64(this.pool(), *id, 16, txn)?;
                 Ok(())
             })?;
-            self.push_op(
-                txn,
-                LogicalOp::Delete {
-                    table_id: table.id,
-                    rid_page: id.page,
-                    rid_slot: id.slot,
-                    values: dec.values,
-                },
-            )?;
+            self.push_op(txn, op.ok_or_else(|| Error::Corrupt {
+                detail: "delete missing logical op".into(),
+            })?)?;
             n += 1;
         }
         Ok(n)
@@ -563,23 +558,23 @@ impl Store for Inner {
             claim(&old, txn, snapshot)?;
             self.ensure_unique(&table, new_values, txn, Some(*id))?;
             let tuple = tuple::encode_tuple(txn, 0, 0, 0, new_values)?;
-            let new_rid = self.mutate(txn, |this| {
+            let (_, op) = self.mutate(txn, None, |this, logical| {
                 Heap::write_header_u64(this.pool(), *id, 16, txn)?;
                 let new_rid = Heap::insert(this.pool(), PageId(table.heap_root), &tuple)?;
                 this.maintain_insert(&table, new_rid, new_values)?;
-                Ok(new_rid)
-            })?;
-            self.push_op(
-                txn,
-                LogicalOp::Update {
+                *logical = Some(LogicalOp::Update {
                     table_id: table.id,
                     old_page: id.page,
                     old_slot: id.slot,
                     new_page: new_rid.page,
                     new_slot: new_rid.slot,
                     values: new_values.clone(),
-                },
-            )?;
+                });
+                Ok(())
+            })?;
+            self.push_op(txn, op.ok_or_else(|| Error::Corrupt {
+                detail: "update missing logical op".into(),
+            })?)?;
             n += 1;
         }
         Ok(n)
@@ -857,7 +852,9 @@ impl Inner {
     }
 
     fn visible_row(&self, id: Rid, snapshot: u64, own: Option<u64>) -> Result<Option<Row>> {
-        let dec = tuple::decode_tuple(&Heap::read(self.pool(), id)?)?;
+        let Some(dec) = read_live(self.pool(), id)? else {
+            return Ok(None);
+        };
         if visible(&dec, snapshot, own) {
             Ok(Some(Row { rid: id, values: dec.values }))
         } else {
@@ -1009,11 +1006,26 @@ fn claim(dec: &DecodedTuple, own: u64, snapshot: u64) -> Result<()> {
 }
 
 fn key_taken(pool: &BufferPool, id: Rid, snapshot: u64, own: u64) -> Result<bool> {
-    let dec = tuple::decode_tuple(&Heap::read(pool, id)?)?;
+    let Some(dec) = read_live(pool, id)? else {
+        return Ok(false);
+    };
+    // Another writer's uncommitted insert still owns the key.
+    if dec.xmin_ts == 0 && dec.xmin_txn != 0 && dec.xmin_txn != own && dec.xmax_txn != dec.xmin_txn {
+        return Ok(true);
+    }
     if dec.xmin_txn == own && dec.xmax_txn != own {
         return Ok(true);
     }
     Ok(dec.xmin_ts != 0 && dec.xmin_ts <= snapshot && (dec.xmax_ts == 0 || dec.xmax_ts > snapshot))
+}
+
+fn read_live(pool: &BufferPool, id: Rid) -> Result<Option<DecodedTuple>> {
+    match Heap::read(pool, id) {
+        Ok(bytes) if bytes.is_empty() => Ok(None),
+        Ok(bytes) => Ok(Some(tuple::decode_tuple(&bytes)?)),
+        Err(Error::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn project_cols(table: &TableDef, columns: &[String], values: &[Value]) -> Result<Vec<Value>> {
@@ -1099,6 +1111,7 @@ impl WriterGate {
         }
     }
 
+    #[allow(dead_code)]
     fn acquire(&self, id: u64, timeout: Option<Duration>) -> Result<()> {
         let mut owner = self.owner.lock().map_err(|_| Error::Corrupt {
             detail: "writer gate poisoned".into(),
@@ -1155,6 +1168,7 @@ impl WriterGate {
     }
 }
 
+#[allow(dead_code)]
 fn sql_may_write(sql: &str) -> bool {
     let trimmed = sql.trim_start();
     if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("explain") {

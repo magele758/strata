@@ -24,6 +24,8 @@ fn cfg() -> Config {
         buffer_pages: 128,
         columnar_flush_every: 10_000,
         password: None,
+        lock_wait_ms: Some(2_000),
+        max_connections: 8,
     }
 }
 

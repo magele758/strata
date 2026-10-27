@@ -16,6 +16,7 @@ pub mod pgwire;
 pub mod replicate;
 pub mod server;
 mod tuple;
+mod undo;
 mod types;
 mod value;
 mod wal;
