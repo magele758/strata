@@ -210,6 +210,8 @@ pub struct Config {
     pub buffer_pages: usize,
     pub columnar_flush_every: u64,
     pub password: Option<String>,
+    pub lock_wait_ms: Option<u64>,
+    pub max_connections: usize,
 }
 
 impl Default for Config {
@@ -218,6 +220,8 @@ impl Default for Config {
             buffer_pages: 128,
             columnar_flush_every: 32,
             password: None,
+            lock_wait_ms: None,
+            max_connections: 128,
         }
     }
 }

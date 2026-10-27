@@ -68,9 +68,9 @@ struct Store<'a> {
 
 impl HnswIndex {
     pub fn create(pool: &BufferPool, dim: u32) -> Result<PageId> {
-        if dim == 0 || dim > 64 {
+        if dim == 0 || dim > 768 {
             return Err(Error::Type(format!(
-                "hnsw dimension {dim} is outside 1..=64"
+                "hnsw dimension {dim} is outside 1..=768"
             )));
         }
         let id = pool.alloc(PageKind::Hnsw)?;
@@ -172,7 +172,7 @@ impl<'a> Store<'a> {
         check_root(&page)?;
         let p = page.payload();
         let dim = read_u32(p, OFF_DIM)?;
-        if dim == 0 || dim > 64 {
+        if dim == 0 || dim > 768 {
             return Err(corrupt(format!("stored hnsw dim {dim} is invalid")));
         }
         let max_level = p[OFF_MAX_LEVEL];

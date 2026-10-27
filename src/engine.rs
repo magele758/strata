@@ -2,8 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 
@@ -39,6 +40,8 @@ pub struct Database {
     inner: Mutex<Option<Inner>>,
     lock: Option<File>,
     crashed: AtomicBool,
+    gate: WriterGate,
+    next_gate: AtomicU64,
 }
 
 impl Database {
@@ -65,6 +68,8 @@ impl Database {
             inner: Mutex::new(Some(inner)),
             lock: Some(lock),
             crashed: AtomicBool::new(false),
+            gate: WriterGate::new(),
+            next_gate: AtomicU64::new(1),
         })
     }
 
@@ -87,32 +92,72 @@ impl Database {
             inner: Mutex::new(Some(inner)),
             lock: Some(lock),
             crashed: AtomicBool::new(false),
+            gate: WriterGate::new(),
+            next_gate: AtomicU64::new(1),
         })
     }
 
     pub fn session(&self) -> Session {
-        Session::new()
+        let mut session = Session::new();
+        session.gate_id = self.next_gate.fetch_add(1, Ordering::Relaxed);
+        session
     }
 
     pub fn execute(&self, sql: &str) -> Result<ExecuteResult> {
-        let mut session = Session::new();
+        let mut session = self.session();
         let result = self.execute_session(&mut session, sql);
         if session.txn_id.is_some() {
             let _ = self.rollback_session(&mut session);
         }
+        self.release_if_idle(&mut session);
         result
     }
 
     pub fn execute_session(&self, session: &mut Session, sql: &str) -> Result<ExecuteResult> {
-        let guard = self.lock_inner()?;
-        let inner = guard.as_ref().ok_or(Error::Closed)?;
-        crate::exec::run_sql(inner, session, sql)
+        self.ensure_gate_id(session);
+        if sql_may_write(sql) && !session.holding_write {
+            self.gate.acquire(session.gate_id, self.lock_wait())?;
+            session.holding_write = true;
+        }
+        let result = {
+            let guard = self.lock_inner()?;
+            let inner = guard.as_ref().ok_or(Error::Closed)?;
+            crate::exec::run_sql(inner, session, sql)
+        };
+        if session.txn_id.is_none() {
+            self.release_if_idle(session);
+        }
+        result
     }
 
     pub fn rollback_session(&self, session: &mut Session) -> Result<()> {
-        let guard = self.lock_inner()?;
-        let inner = guard.as_ref().ok_or(Error::Closed)?;
-        inner.rollback(session)
+        let result = {
+            let guard = self.lock_inner()?;
+            let inner = guard.as_ref().ok_or(Error::Closed)?;
+            inner.rollback(session)
+        };
+        self.release_if_idle(session);
+        result
+    }
+
+    fn ensure_gate_id(&self, session: &mut Session) {
+        if session.gate_id == 0 {
+            session.gate_id = self.next_gate.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn release_if_idle(&self, session: &mut Session) {
+        if session.holding_write && session.txn_id.is_none() {
+            self.gate.release(session.gate_id);
+            session.holding_write = false;
+        }
+    }
+
+    fn lock_wait(&self) -> Option<Duration> {
+        let Ok(guard) = self.inner.lock() else {
+            return None;
+        };
+        guard.as_ref().and_then(|inner| inner.config.lock_wait_ms.map(Duration::from_millis))
     }
 
     pub fn checkpoint(&self) -> Result<()> {
@@ -1039,4 +1084,90 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+struct WriterGate {
+    owner: Mutex<Option<u64>>,
+    cv: Condvar,
+}
+
+impl WriterGate {
+    fn new() -> Self {
+        Self {
+            owner: Mutex::new(None),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, id: u64, timeout: Option<Duration>) -> Result<()> {
+        let mut owner = self.owner.lock().map_err(|_| Error::Corrupt {
+            detail: "writer gate poisoned".into(),
+        })?;
+        let started = Instant::now();
+        loop {
+            match *owner {
+                Some(held) if held == id => return Ok(()),
+                None => {
+                    *owner = Some(id);
+                    return Ok(());
+                }
+                Some(_) => {
+                    owner = match timeout {
+                        None => self.cv.wait(owner).map_err(|_| Error::Corrupt {
+                            detail: "writer gate poisoned".into(),
+                        })?,
+                        Some(limit) => {
+                            let left = limit.saturating_sub(started.elapsed());
+                            if left.is_zero() {
+                                return Err(Error::Limit(
+                                    "timed out waiting for the writer".into(),
+                                ));
+                            }
+                            let (guard, status) = self.cv.wait_timeout(owner, left).map_err(|_| {
+                                Error::Corrupt {
+                                    detail: "writer gate poisoned".into(),
+                                }
+                            })?;
+                            if status.timed_out() {
+                                if guard.as_ref() == Some(&id) || guard.is_none() {
+                                    owner = guard;
+                                    continue;
+                                }
+                                return Err(Error::Limit(
+                                    "timed out waiting for the writer".into(),
+                                ));
+                            }
+                            guard
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    fn release(&self, id: u64) {
+        if let Ok(mut owner) = self.owner.lock() {
+            if *owner == Some(id) {
+                *owner = None;
+                self.cv.notify_one();
+            }
+        }
+    }
+}
+
+fn sql_may_write(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("explain") {
+        return false;
+    }
+    let lower = sql.to_ascii_lowercase();
+    for token in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if matches!(
+            token,
+            "insert" | "update" | "delete" | "create" | "drop" | "vacuum" | "flush" | "checkpoint" | "alter"
+        ) {
+            return true;
+        }
+    }
+    false
 }

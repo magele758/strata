@@ -355,6 +355,8 @@ pub struct CommittedOp {
 pub struct Session {
     pub txn_id: Option<u64>,
     pub snapshot_ts: u64,
+    pub gate_id: u64,
+    pub holding_write: bool,
 }
 
 impl Session {
@@ -362,6 +364,8 @@ impl Session {
         Self {
             txn_id: None,
             snapshot_ts: 0,
+            gate_id: 0,
+            holding_write: false,
         }
     }
 }

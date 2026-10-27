@@ -34,28 +34,57 @@ const TAG_ERROR: u8 = 2;
 
 /// Bind `addr` and serve `db` until the process stops. One thread per connection.
 pub fn serve(db: Arc<Database>, addr: &str, password: Option<String>) -> Result<()> {
+    serve_limited(db, addr, password, 128)
+}
+
+pub fn serve_limited(
+    db: Arc<Database>,
+    addr: &str,
+    password: Option<String>,
+    max_connections: usize,
+) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         match listener.accept() {
-            Ok((stream, _)) => spawn_connection(stream, Arc::clone(&db), password.clone()),
+            Ok((stream, _)) => {
+                let n = live.load(std::sync::atomic::Ordering::Relaxed);
+                if n >= max_connections {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
+                live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let counter = Arc::clone(&live);
+                spawn_connection(stream, Arc::clone(&db), password.clone(), counter);
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => eprintln!("strata: accept: {e}"),
         }
     }
 }
 
-fn spawn_connection(stream: TcpStream, db: Arc<Database>, password: Option<String>) {
+fn spawn_connection(
+    stream: TcpStream,
+    db: Arc<Database>,
+    password: Option<String>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+) {
     let built = std::thread::Builder::new()
         .name("strata-conn".into())
-        .spawn(move || {
+        .spawn({
+            let live = Arc::clone(&live);
+            move || {
             let run = std::panic::AssertUnwindSafe(|| connection(stream, db, password));
             match std::panic::catch_unwind(run) {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => eprintln!("strata: {e}"),
                 Err(_) => eprintln!("strata: connection handler panicked"),
             }
+            live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
         });
     if let Err(e) = built {
+        live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!("strata: spawn: {e}");
     }
 }

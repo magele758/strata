@@ -13,6 +13,8 @@ fn cfg() -> Config {
         buffer_pages: 128,
         columnar_flush_every: 10_000,
         password: None,
+        lock_wait_ms: Some(2_000),
+        max_connections: 128,
     }
 }
 
@@ -80,22 +82,30 @@ fn snapshot_isolation_and_write_write_conflict() {
 }
 
 #[test]
-fn second_writer_waits_behind_the_open_writer() {
+fn second_writer_waits_and_reader_still_sees_snapshot() {
     let path = dir("writer");
-    let db = Database::create(&path, cfg()).unwrap();
+    let db = std::sync::Arc::new(Database::create(&path, cfg()).unwrap());
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 5), (2, 5)").unwrap();
     let mut a = db.session();
-    let mut b = db.session();
     db.execute_session(&mut a, "BEGIN").unwrap();
-    db.execute_session(&mut b, "BEGIN").unwrap();
     db.execute_session(&mut a, "UPDATE t SET n = 0 WHERE id = 1").unwrap();
-    let busy = db.execute_session(&mut b, "UPDATE t SET n = 0 WHERE id = 2");
-    assert!(busy.is_err(), "one writer at a time; page-image undo is not safe if writers interleave");
-    let seen = rows(db.execute_session(&mut b, "SELECT n FROM t WHERE id = 1").unwrap());
-    assert_eq!(seen, vec![vec![Value::Int(5)]], "reader snapshot stays at begin");
+
+    let mut reader = db.session();
+    let seen = rows(db.execute_session(&mut reader, "SELECT n FROM t WHERE id = 1").unwrap());
+    assert_eq!(seen, vec![vec![Value::Int(5)]]);
+
+    let waiting = std::sync::Arc::clone(&db);
+    let handle = std::thread::spawn(move || {
+        let mut b = waiting.session();
+        waiting.execute_session(&mut b, "UPDATE t SET n = 9 WHERE id = 2")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert!(!handle.is_finished());
     db.execute_session(&mut a, "COMMIT").unwrap();
-    db.execute_session(&mut b, "ROLLBACK").ok();
+    handle.join().unwrap().unwrap();
+    let got = rows(db.execute("SELECT n FROM t WHERE id = 2").unwrap());
+    assert_eq!(got, vec![vec![Value::Int(9)]]);
     let _ = std::fs::remove_dir_all(&path);
 }
 

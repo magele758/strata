@@ -14,7 +14,7 @@ usage: strata <command> [options]
   exec PATH --sql SQL [--password SECRET]
   serve PATH [--addr ADDR] [--password SECRET]
   check PATH [--password SECRET]
-  backup PATH DEST [--password SECRET]
+  replicate PRIMARY REPLICA
 ADDR defaults to 127.0.0.1:7432";
 
 fn main() -> ExitCode {
@@ -73,6 +73,10 @@ fn run() -> Result<(), CliError> {
                 flags.password,
             )
         }
+        "replicate" => {
+            expect(&flags, false, false, 2)?;
+            cmd_replicate(&flags.positionals[0], &flags.positionals[1])
+        }
         _ => Err(CliError::Usage),
     }
 }
@@ -96,6 +100,11 @@ fn cmd_backup(path: &str, dest: &str, password: Option<String>) -> Result<(), Cl
     let closed = db.close();
     copied?;
     closed?;
+    Ok(())
+}
+fn cmd_replicate(primary: &str, replica: &str) -> Result<(), CliError> {
+    let lsn = strata::replicate::catch_up(primary.as_ref(), replica.as_ref())?;
+    write_stdout(&format!("applied {lsn}"))?;
     Ok(())
 }
 

@@ -11,6 +11,7 @@ cargo run -- shell ./demo
 cargo run -- check ./demo
 cargo run -- backup ./demo ./demo.bak
 cargo run -- serve ./demo --addr 127.0.0.1:7432 --password secret
+cargo run -- replicate ./demo ./demo-replica
 ```
 
 `exec` is auto-commit. `shell` and `serve` keep a session, so `BEGIN` / `COMMIT` stick on that connection.
@@ -31,7 +32,7 @@ CREATE INDEX t_v ON t USING hnsw (v);
 SELECT id FROM t WHERE knn(v, '[1,0,0]', 5);
 ```
 
-`search` is conjunctive BM25. `knn` is L2. HNSW dimensions are 1..=64.
+`search` is conjunctive BM25. `knn` is L2. HNSW dimensions are 1..=768.
 
 ## What is actually durable
 
@@ -40,8 +41,15 @@ SELECT id FROM t WHERE knn(v, '[1,0,0]', 5);
 - Recovery replays page images from the last checkpoint, then undoes transactions that have no commit record.
 - `Database::simulate_crash` drops the cache without a checkpoint. The next `open` must rebuild from the WAL. Normal drop checkpoints.
 - One process holds `strata.lock`. A second open fails.
+- A second writer waits for the open write transaction. A reader can run between that writer's statements and keeps its own snapshot. The statement itself still holds the database lock.
 
-Isolation is snapshot isolation, not serializable. One writer at a time. Other sessions can keep a snapshot and read. A second writer gets an error until the first commits or rolls back. That limit exists because undo restores page images; interleaved writers on the same page would wipe each other.
+`replicate` copies every committed page image from the primary WAL into another directory. That standby can be opened and read. It does not tail the log live, and it does not elect a new leader.
+
+`strata::cluster::RangeCluster` routes an integer primary key named `id` across local shard directories. It is not a distributed transaction and it is not Raft. `BEGIN`, joins, and updates that change `id` return a `cross-shard` error.
+
+`serve` accepts at most 128 connections. `strata::pgwire::serve_simple` speaks a Postgres simple-query subset, without TLS and without the extended protocol.
+
+Isolation is snapshot isolation, not serializable. Undo still restores whole page images, so two writers are not allowed to interleave. The second one waits.
 
 ## Access methods and the columnar replica
 
