@@ -402,14 +402,33 @@ impl Store for Inner {
         if index.method != IndexMethod::Hnsw {
             return Err(Error::Plan(format!("{} is not an hnsw index", index.name)));
         }
-        let hits = HnswIndex::search(self.pool(), PageId(index.root), vector, k)?;
+        // Indexes are add-only: DELETE/UPDATE leave the old RID in the graph
+        // until VACUUM rebuilds it. Search returns the k nearest index hits,
+        // so a deleted neighbor can fill the top slot and hide a live one.
+        // Overfetch and retry until k visible rows are collected or the index
+        // is exhausted. HNSW search already walks ef = max(64, k) candidates.
+        let mut fetch = k.max(1);
         let mut out = Vec::new();
-        for (id, dist) in hits {
-            if let Some(row) = self.visible_row(id, snapshot, own)? {
-                out.push((row, dist));
+        loop {
+            let hits = HnswIndex::search(self.pool(), PageId(index.root), vector, fetch)?;
+            out.clear();
+            for (id, dist) in &hits {
+                if let Some(row) = self.visible_row(*id, snapshot, own)? {
+                    out.push((row, *dist));
+                    if out.len() == k {
+                        return Ok(out);
+                    }
+                }
             }
+            if hits.len() < fetch {
+                return Ok(out);
+            }
+            let next = fetch.saturating_mul(2);
+            if next == fetch {
+                return Ok(out);
+            }
+            fetch = next;
         }
-        Ok(out)
     }
 
     fn scan_columnar(&self, table: &str, snapshot: u64, own_writes: bool) -> Result<Option<Vec<Row>>> {
