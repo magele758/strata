@@ -34,6 +34,7 @@ struct Inner {
     config: Config,
     columnar: RefCell<ColumnarReplica>,
     commits_since_flush: Cell<u64>,
+    pending_flush: Cell<Option<(u64, u64)>>,
 }
 
 pub struct Database {
@@ -42,6 +43,7 @@ pub struct Database {
     crashed: AtomicBool,
     gate: WriterGate,
     next_gate: AtomicU64,
+    group: GroupCommit,
 }
 
 impl Database {
@@ -54,6 +56,7 @@ impl Database {
         let lock = lock_dir(path)?;
         let pool = BufferPool::create(path, config.buffer_pages)?;
         let columnar = ColumnarReplica::open(&path.join("col"))?;
+        let window = Duration::from_millis(config.group_commit_ms);
         let inner = Inner {
             pool,
             catalog: RefCell::new(Catalog::empty()),
@@ -63,6 +66,7 @@ impl Database {
             config,
             columnar: RefCell::new(columnar),
             commits_since_flush: Cell::new(0),
+            pending_flush: Cell::new(None),
         };
         Ok(Self {
             inner: Mutex::new(Some(inner)),
@@ -70,6 +74,7 @@ impl Database {
             crashed: AtomicBool::new(false),
             gate: WriterGate::new(),
             next_gate: AtomicU64::new(1),
+            group: GroupCommit::new(window),
         })
     }
 
@@ -78,6 +83,7 @@ impl Database {
         let lock = lock_dir(path)?;
         let (pool, recovery) = BufferPool::open(path, config.buffer_pages)?;
         let columnar = ColumnarReplica::open(&path.join("col"))?;
+        let window = Duration::from_millis(config.group_commit_ms);
         let inner = Inner {
             pool,
             catalog: RefCell::new(recovery.catalog),
@@ -87,6 +93,7 @@ impl Database {
             config,
             columnar: RefCell::new(columnar),
             commits_since_flush: Cell::new(0),
+            pending_flush: Cell::new(None),
         };
         Ok(Self {
             inner: Mutex::new(Some(inner)),
@@ -94,6 +101,7 @@ impl Database {
             crashed: AtomicBool::new(false),
             gate: WriterGate::new(),
             next_gate: AtomicU64::new(1),
+            group: GroupCommit::new(window),
         })
     }
 
@@ -115,15 +123,75 @@ impl Database {
 
     pub fn execute_session(&self, session: &mut Session, sql: &str) -> Result<ExecuteResult> {
         self.ensure_gate_id(session);
-        let result = {
+        let _ticket = if will_commit(sql, session) {
+            Some(self.group.reserve())
+        } else {
+            None
+        };
+        let (result, pending) = {
             let guard = self.lock_inner()?;
             let inner = guard.as_ref().ok_or(Error::Closed)?;
-            crate::exec::run_sql(inner, session, sql)
+            let result = crate::exec::run_sql(inner, session, sql);
+            let pending = inner.pending_flush.take();
+            (result, pending)
         };
+        drop(_ticket);
+        if let Some((lsn, ts)) = pending {
+            self.durable(lsn)?;
+            let guard = self.lock_inner()?;
+            let inner = guard.as_ref().ok_or(Error::Closed)?;
+            {
+                let mut cat = inner.catalog.borrow_mut();
+                if ts > cat.next_commit_ts {
+                    cat.next_commit_ts = ts;
+                }
+            }
+            let published = inner.catalog.borrow().next_commit_ts;
+            if session.snapshot_ts < published {
+                session.snapshot_ts = published;
+            }
+        }
         if session.txn_id.is_none() {
             self.release_if_idle(session);
         }
         result
+    }
+
+    pub fn wal_syncs(&self) -> Result<u64> {
+        let guard = self.lock_inner()?;
+        let inner = guard.as_ref().ok_or(Error::Closed)?;
+        inner.pool.wal_syncs()
+    }
+
+    fn durable(&self, lsn: u64) -> Result<()> {
+        loop {
+            match self.group.prepare(lsn)? {
+                Role::Done => return Ok(()),
+                Role::Leader => {
+                    let flushed = match self.flush_wal_lsn() {
+                        Ok(flushed) => flushed,
+                        Err(err) => {
+                            self.group.abort_leader();
+                            return Err(err);
+                        }
+                    };
+                    self.group.finish(flushed);
+                    return Ok(());
+                }
+                Role::Follower => {
+                    if self.group.wait_flushed(lsn)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    fn flush_wal_lsn(&self) -> Result<u64> {
+        let guard = self.lock_inner()?;
+        let inner = guard.as_ref().ok_or(Error::Closed)?;
+        inner.pool.flush_wal()?;
+        inner.pool.wal_flushed_lsn()
     }
 
     pub fn rollback_session(&self, session: &mut Session) -> Result<()> {
@@ -266,9 +334,8 @@ impl Inner {
         let txn = self.alloc_txn();
         self.mutate(txn, None, |this, _| f(this))?;
         let ts = self.catalog.borrow().next_commit_ts + 1;
-        self.pool.append_commit(txn, ts, &[])?;
-        self.pool.flush_wal()?;
-        self.catalog.borrow_mut().next_commit_ts = ts;
+        let lsn = self.pool.append_commit(txn, ts, &[])?;
+        self.pending_flush.set(Some((lsn, ts)));
         Ok(())
     }
 
@@ -338,9 +405,9 @@ impl Store for Inner {
             this.catalog.borrow_mut().next_commit_ts = ts;
             Ok(())
         })?;
-        self.pool.append_commit(txn, ts, &active.ops)?;
-        self.pool.flush_wal()?;
-        session.snapshot_ts = ts;
+        self.catalog.borrow_mut().next_commit_ts = ts - 1;
+        let lsn = self.pool.append_commit(txn, ts, &active.ops)?;
+        self.pending_flush.set(Some((lsn, ts)));
         self.note_commit()?;
         Ok(())
     }
@@ -1098,6 +1165,138 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+enum Role {
+    Done,
+    Leader,
+    Follower,
+}
+
+struct GroupState {
+    joining: usize,
+    leader: bool,
+    flushed: u64,
+}
+
+struct GroupCommit {
+    mu: Mutex<GroupState>,
+    cv: Condvar,
+    window: Duration,
+}
+
+struct CommitTicket<'a> {
+    group: &'a GroupCommit,
+}
+
+impl Drop for CommitTicket<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.group.mu.lock() {
+            state.joining = state.joining.saturating_sub(1);
+            self.group.cv.notify_all();
+        }
+    }
+}
+
+impl GroupCommit {
+    fn new(window: Duration) -> Self {
+        Self {
+            mu: Mutex::new(GroupState {
+                joining: 0,
+                leader: false,
+                flushed: 0,
+            }),
+            cv: Condvar::new(),
+            window,
+        }
+    }
+
+    fn reserve(&self) -> CommitTicket<'_> {
+        if let Ok(mut state) = self.mu.lock() {
+            state.joining += 1;
+            self.cv.notify_all();
+        }
+        CommitTicket { group: self }
+    }
+
+    fn prepare(&self, lsn: u64) -> Result<Role> {
+        let mut state = self.lock()?;
+        if state.flushed >= lsn {
+            return Ok(Role::Done);
+        }
+        if state.leader {
+            return Ok(Role::Follower);
+        }
+        state.leader = true;
+        let deadline = Instant::now() + self.window;
+        loop {
+            if state.joining > 0 {
+                while state.joining > 0 {
+                    state = self.cv.wait(state).map_err(|_| Error::Corrupt {
+                        detail: "group commit poisoned".into(),
+                    })?;
+                }
+                break;
+            }
+            if self.window.is_zero() || Instant::now() >= deadline {
+                break;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let (guard, status) = self.cv.wait_timeout(state, left).map_err(|_| Error::Corrupt {
+                detail: "group commit poisoned".into(),
+            })?;
+            state = guard;
+            if status.timed_out() && state.joining == 0 {
+                break;
+            }
+        }
+        Ok(Role::Leader)
+    }
+
+    fn finish(&self, flushed: u64) {
+        if let Ok(mut state) = self.mu.lock() {
+            if flushed > state.flushed {
+                state.flushed = flushed;
+            }
+            state.leader = false;
+            self.cv.notify_all();
+        }
+    }
+
+    fn abort_leader(&self) {
+        if let Ok(mut state) = self.mu.lock() {
+            state.leader = false;
+            self.cv.notify_all();
+        }
+    }
+
+    fn wait_flushed(&self, lsn: u64) -> Result<bool> {
+        let mut state = self.lock()?;
+        while state.flushed < lsn && state.leader {
+            state = self.cv.wait(state).map_err(|_| Error::Corrupt {
+                detail: "group commit poisoned".into(),
+            })?;
+        }
+        Ok(state.flushed >= lsn)
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, GroupState>> {
+        self.mu.lock().map_err(|_| Error::Corrupt {
+            detail: "group commit poisoned".into(),
+        })
+    }
+}
+
+fn will_commit(sql: &str, session: &Session) -> bool {
+    let trimmed = sql.trim_start();
+    let token = trimmed
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|part| !part.is_empty())
+        .unwrap_or("");
+    if token.eq_ignore_ascii_case("commit") {
+        return true;
+    }
+    session.txn_id.is_none() && sql_may_write(sql)
+}
+
 struct WriterGate {
     owner: Mutex<Option<u64>>,
     cv: Condvar,
@@ -1168,7 +1367,7 @@ impl WriterGate {
     }
 }
 
-#[allow(dead_code)]
+
 fn sql_may_write(sql: &str) -> bool {
     let trimmed = sql.trim_start();
     if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("explain") {

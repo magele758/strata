@@ -37,7 +37,7 @@ SELECT id FROM t WHERE knn(v, '[1,0,0]', 5);
 ## What is actually durable
 
 - 4KB pages, checksummed. Torn pages fail the checksum.
-- Commit flushes the WAL and not the data pages (no-force). Dirty pages can be stolen only after their LSN is flushed.
+- Commit appends the commit record, releases the database lock, then one leader fsyncs every commit that joined within `group_commit_ms` (default 2). The commit timestamp is published only after that fsync.
 - Recovery replays page images from the last checkpoint, then undoes a loser's tuples. It does not restore that loser's whole page when the mutation recorded a logical operation.
 - `Database::simulate_crash` drops the cache without a checkpoint. The next `open` must rebuild from the WAL. Normal drop checkpoints.
 - One process holds `strata.lock`. A second open fails.

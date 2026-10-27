@@ -15,6 +15,7 @@ fn cfg() -> Config {
         password: None,
         lock_wait_ms: Some(2_000),
         max_connections: 128,
+        group_commit_ms: 2,
     }
 }
 

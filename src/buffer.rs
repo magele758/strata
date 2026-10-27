@@ -242,6 +242,14 @@ impl BufferPool {
         lock(&self.inner)?.wal.flush()
     }
 
+    pub fn wal_flushed_lsn(&self) -> Result<u64> {
+        Ok(lock(&self.inner)?.wal.flushed_lsn())
+    }
+
+    pub fn wal_syncs(&self) -> Result<u64> {
+        Ok(lock(&self.inner)?.wal.syncs())
+    }
+
     pub fn checkpoint(&self, catalog: &[u8]) -> Result<()> {
         let mut st = lock(&self.inner)?;
         if st.group.is_some() {

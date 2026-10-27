@@ -55,6 +55,7 @@ pub struct Wal {
     path: PathBuf,
     next_lsn: u64,
     flushed_lsn: u64,
+    syncs: u64,
 }
 
 impl Wal {
@@ -72,6 +73,7 @@ impl Wal {
             path: path.to_path_buf(),
             next_lsn: 1,
             flushed_lsn: 0,
+            syncs: 0,
         };
         wal.write_header()?;
         wal.file.sync_all()?;
@@ -137,6 +139,7 @@ impl Wal {
             path: path.to_path_buf(),
             next_lsn,
             flushed_lsn: records.last().map(|r| r.lsn).unwrap_or(0),
+            syncs: 0,
         };
         Ok((wal, records))
     }
@@ -161,11 +164,16 @@ impl Wal {
     pub fn flush(&mut self) -> Result<()> {
         self.file.sync_all()?;
         self.flushed_lsn = self.next_lsn.saturating_sub(1);
+        self.syncs += 1;
         Ok(())
     }
 
     pub fn flushed_lsn(&self) -> u64 {
         self.flushed_lsn
+    }
+
+    pub fn syncs(&self) -> u64 {
+        self.syncs
     }
 
     pub fn next_lsn(&self) -> u64 {

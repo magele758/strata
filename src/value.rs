@@ -212,6 +212,8 @@ pub struct Config {
     pub password: Option<String>,
     pub lock_wait_ms: Option<u64>,
     pub max_connections: usize,
+    /// How long a commit leader waits for another commit to join one fsync.
+    pub group_commit_ms: u64,
 }
 
 impl Default for Config {
@@ -222,6 +224,7 @@ impl Default for Config {
             password: None,
             lock_wait_ms: None,
             max_connections: 128,
+            group_commit_ms: 2,
         }
     }
 }
